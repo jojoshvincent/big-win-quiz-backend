@@ -1,16 +1,17 @@
 import nodemailer from "nodemailer";
 
 export const transporter = nodemailer.createTransport({
-  service: "gmail",
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT || 2525),
   auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS   // Gmail App Password
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS
   }
 });
 
 export async function sendOTPEmail(email, otp) {
   await transporter.sendMail({
-    from: `"Quiz App" <${process.env.EMAIL_USER}>`,
+    from: process.env.SMTP_FROM || `"Quiz App" <${process.env.SMTP_USER}>`,
     to: email,
     subject: "Verify your email",
     html: `

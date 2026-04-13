@@ -1,0 +1,67 @@
+[
+  {
+    "id": "q1",
+    "question": "What is 2 + 2?",
+    "options": ["3", "4", "5", "6"],
+    "correctAnswer": "4"
+  },
+  {
+    "id": "q2",
+    "question": "What is the capital of France?",
+    "options": ["Berlin", "Madrid", "Paris", "Rome"],
+    "correctAnswer": "Paris"
+  },
+  {
+    "id": "q3",
+    "question": "Which planet is known as the Red Planet?",
+    "options": ["Earth", "Mars", "Venus", "Jupiter"],
+    "correctAnswer": "Mars"
+  },
+  {
+    "id": "q4",
+    "question": "What is 5 x 6?",
+    "options": ["11", "30", "56", "65"],
+    "correctAnswer": "30"
+  },
+  {
+    "id": "q5",
+    "question": "Which language runs in the browser?",
+    "options": ["Java", "C#", "Python", "JavaScript"],
+    "correctAnswer": "JavaScript"
+  },
+  {
+    "id": "q6",
+    "question": "What does HTTP stand for?",
+    "options": [
+      "HyperText Transfer Protocol",
+      "HighText Transfer Protocol",
+      "Hyper Transfer Text Process",
+      "Home Transfer Text Protocol"
+    ],
+    "correctAnswer": "HyperText Transfer Protocol"
+  },
+  {
+    "id": "q7",
+    "question": "Which ocean is the largest?",
+    "options": ["Atlantic", "Indian", "Pacific", "Arctic"],
+    "correctAnswer": "Pacific"
+  },
+  {
+    "id": "q8",
+    "question": "What is the square root of 81?",
+    "options": ["7", "8", "9", "10"],
+    "correctAnswer": "9"
+  },
+  {
+    "id": "q9",
+    "question": "Which data type is used for true/false values in JavaScript?",
+    "options": ["Number", "Boolean", "String", "Array"],
+    "correctAnswer": "Boolean"
+  },
+  {
+    "id": "q10",
+    "question": "How many days are there in a leap year?",
+    "options": ["365", "366", "364", "367"],
+    "correctAnswer": "366"
+  }
+]

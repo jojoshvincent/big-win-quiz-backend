@@ -2,6 +2,8 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
+import fs from "node:fs";
+import path from "node:path";
 
 import { db } from "./db.js";
 import {
@@ -16,16 +18,141 @@ import {
 
 import { generateOTP } from "./otp.js";
 import { sendOTPEmail } from "./mailer.js";
+import { analyzeSentimentAgentic } from "./sentimentAgent.js";
 
 const app = express();
+const QUIZ_LENGTH = 10;
+const MAX_QUIZ_ATTEMPTS = 10;
 app.use(helmet());
-app.use(cors());
+const allowedOrigins = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, callback) {
+    // allow non-browser tools (no Origin header)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error(`Origin not allowed by CORS: ${origin}`));
+  },
+  credentials: true
+}));
 app.use(express.json({ limit: "64kb" }));
+
+function loadQuizQuestions() {
+  const filePath = path.join(process.cwd(), "questions.json");
+  const raw = fs.readFileSync(filePath, "utf8");
+  const parsed = JSON.parse(raw);
+  if (!Array.isArray(parsed) || parsed.length < QUIZ_LENGTH) {
+    throw new Error(`questions.json must contain at least ${QUIZ_LENGTH} questions`);
+  }
+  return parsed.slice(0, QUIZ_LENGTH);
+}
+
+function toOptionObject(option, optionIndex) {
+  const fallbackId = String.fromCharCode(97 + optionIndex); // a, b, c, d...
+  if (typeof option === "string") {
+    return { id: fallbackId, label: fallbackId.toUpperCase(), text: option };
+  }
+  return {
+    id: String(option?.id ?? fallbackId),
+    label: String(option?.label ?? String(option?.id ?? fallbackId).toUpperCase()),
+    text: String(option?.text ?? "")
+  };
+}
+
+function toPublicQuestion(question, questionIndex) {
+  const normalizedOptions = Array.isArray(question.options)
+    ? question.options.map((option, idx) => toOptionObject(option, idx))
+    : [];
+  return {
+    id: String(question.id ?? questionIndex + 1),
+    type: "multiple_choice",
+    text: String(question.question ?? question.text ?? ""),
+    options: normalizedOptions
+  };
+}
+
+function normalizeAnswer(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function parseAttemptId(value) {
+  const raw = String(value ?? "");
+  if (raw.startsWith("att_")) {
+    return Number(raw.slice(4));
+  }
+  return Number(raw);
+}
+
+function resolveCorrectOptionId(question, questionIndex) {
+  const publicQuestion = toPublicQuestion(question, questionIndex);
+  const options = publicQuestion.options;
+
+  if (question.correctOptionId) {
+    return String(question.correctOptionId).toLowerCase();
+  }
+
+  const correctAnswer = normalizeAnswer(question.correctAnswer);
+  if (!correctAnswer) return null;
+
+  const byId = options.find((opt) => normalizeAnswer(opt.id) === correctAnswer);
+  if (byId) return normalizeAnswer(byId.id);
+
+  const byText = options.find((opt) => normalizeAnswer(opt.text) === correctAnswer);
+  if (byText) return normalizeAnswer(byText.id);
+
+  return null;
+}
 
 /* ---------------- HEALTH ---------------- */
 
 app.get("/health", (req, res) => {
   res.json({ ok: true });
+});
+
+/* ---------------- SENTIMENT (AGENTIC) ---------------- */
+
+app.post("/sentiment/analyze", async (req, res) => {
+  try {
+    const text = String(req.body?.text ?? "").trim();
+    if (!text) {
+      return res.status(400).json({ error: "text is required" });
+    }
+
+    const analysis = await analyzeSentimentAgentic(text);
+    if (analysis.wordCount !== 25) {
+      return res.status(400).json({
+        error: "text must contain exactly 25 words",
+        receivedWordCount: analysis.wordCount
+      });
+    }
+
+    return res.json({
+      message: analysis.message,
+      sentiment: analysis.sentiment,
+      score: analysis.score,
+      scoreOutOf: 100,
+      reason: analysis.reason,
+      evidencePhrases: analysis.evidencePhrases,
+      context: {
+        isOnTopic: analysis.isOnTopic,
+        topic: analysis.topic,
+        emotions: analysis.emotions
+      },
+      meta: {
+        provider: analysis.meta.provider,
+        model: analysis.meta.model,
+        agents: analysis.agents
+      }
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to analyze sentiment" });
+  }
 });
 
 /* ---------------- REGISTER (SEND OTP) ---------------- */
@@ -100,9 +227,9 @@ app.post("/verify-email", async (req, res) => {
     const passwordHash = await hashPassword(password);
 
     const info = db.prepare(`
-      INSERT INTO users (email, password_hash)
-      VALUES (?, ?)
-    `).run(email, passwordHash);
+      INSERT INTO users (email, password_hash, payment_status)
+      VALUES (?, ?, ?)
+    `).run(email, passwordHash, 1);
 
     // cleanup OTP
     db.prepare("DELETE FROM email_otps WHERE email = ?").run(email);
@@ -157,6 +284,358 @@ app.post("/login", async (req, res) => {
 
 app.get("/me", authMiddleware, (req, res) => {
   res.json({ user: req.user });
+});
+
+/* ---------------- DASHBOARD ---------------- */
+
+function mapLastAttemptStatus(dbStatus) {
+  if (!dbStatus) return "none";
+  if (dbStatus === "completed") return "passed";
+  if (dbStatus === "failed") return "failed";
+  if (dbStatus === "in_progress") return "in_progress";
+  return "none";
+}
+
+function hasUserPassedQuiz(userId) {
+  const passedAttempt = db.prepare(`
+    SELECT 1
+    FROM quiz_attempts
+    WHERE user_id = ? AND status = 'completed'
+    LIMIT 1
+  `).get(userId);
+  return Boolean(passedAttempt);
+}
+
+app.get("/dashboard", authMiddleware, (req, res) => {
+  try {
+    const userId = Number(req.user?.sub);
+    if (!userId) return res.status(401).json({ error: "Invalid token" });
+
+    const userRow = db.prepare(`
+      SELECT id, email, name FROM users WHERE id = ?
+    `).get(userId);
+
+    if (!userRow) return res.status(401).json({ error: "User not found" });
+
+    const stats = db.prepare(`
+      SELECT
+        COUNT(*) AS attempt_count,
+        MAX(score) AS best_score
+      FROM quiz_attempts
+      WHERE user_id = ?
+    `).get(userId);
+
+    const lastAttempt = db.prepare(`
+      SELECT status
+      FROM quiz_attempts
+      WHERE user_id = ?
+      ORDER BY id DESC
+      LIMIT 1
+    `).get(userId);
+    const hasPassedQuiz = hasUserPassedQuiz(userId);
+
+    const attemptCount = Number(stats?.attempt_count ?? 0);
+    const hasAttemptedQuiz = attemptCount > 0;
+    const bestRaw = stats?.best_score;
+    const bestScorePercent =
+      !hasAttemptedQuiz || bestRaw === null || bestRaw === undefined
+        ? null
+        : Math.min(100, Math.max(0, Number(bestRaw)));
+
+    const lastAttemptStatus = mapLastAttemptStatus(lastAttempt?.status);
+
+    const displayName = userRow.name != null && String(userRow.name).trim() !== ""
+      ? String(userRow.name).trim()
+      : null;
+
+    return res.json({
+      user: {
+        id: userRow.id,
+        email: userRow.email,
+        name: displayName
+      },
+      quiz: {
+        hasAttemptedQuiz,
+        hasPassedQuiz,
+        quizCompletedSuccessfully: hasPassedQuiz,
+        attemptCount,
+        bestScorePercent,
+        lastAttemptStatus
+      }
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to load dashboard" });
+  }
+});
+
+/* ---------------- QUIZ ---------------- */
+
+app.post("/quiz/start", authMiddleware, (req, res) => {
+  try {
+    const userId = Number(req.user?.sub);
+    if (!userId) return res.status(401).json({ error: "Invalid token" });
+    const hasPassedQuiz = hasUserPassedQuiz(userId);
+
+    const inProgress = db.prepare(`
+      SELECT id, attempt_index, score, current_question_index, status
+      FROM quiz_attempts
+      WHERE user_id = ? AND status = 'in_progress'
+      ORDER BY id DESC
+      LIMIT 1
+    `).get(userId);
+
+    const questions = loadQuizQuestions();
+
+    if (inProgress) {
+      const current = questions[inProgress.current_question_index];
+      return res.json({
+        message: "Resuming in-progress attempt",
+        attemptId: `att_${inProgress.id}`,
+        attemptNumber: inProgress.attempt_index,
+        hasPassedQuiz,
+        quizCompletedSuccessfully: hasPassedQuiz,
+        questionNumber: inProgress.current_question_index + 1,
+        totalQuestions: QUIZ_LENGTH,
+        timeLimitSec: 30,
+        question: toPublicQuestion(current, inProgress.current_question_index)
+      });
+    }
+
+    const totalAttempts = db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM quiz_attempts
+      WHERE user_id = ?
+    `).get(userId).count;
+
+    if (totalAttempts >= MAX_QUIZ_ATTEMPTS) {
+      return res.status(403).json({ error: "Maximum quiz attempts reached" });
+    }
+
+    const attemptIndex = totalAttempts + 1;
+    const info = db.prepare(`
+      INSERT INTO quiz_attempts (user_id, attempt_index, status, score, current_question_index)
+      VALUES (?, ?, 'in_progress', 0, 0)
+    `).run(userId, attemptIndex);
+
+    return res.status(201).json({
+      message: "Quiz attempt started",
+      attemptId: `att_${info.lastInsertRowid}`,
+      attemptNumber: attemptIndex,
+      hasPassedQuiz,
+      quizCompletedSuccessfully: hasPassedQuiz,
+      questionNumber: 1,
+      totalQuestions: QUIZ_LENGTH,
+      timeLimitSec: 30,
+      question: toPublicQuestion(questions[0], 0)
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to start quiz" });
+  }
+});
+
+app.get("/quiz/current", authMiddleware, (req, res) => {
+  try {
+    const userId = Number(req.user?.sub);
+    if (!userId) return res.status(401).json({ error: "Invalid token" });
+    const hasPassedQuiz = hasUserPassedQuiz(userId);
+
+    const attempt = db.prepare(`
+      SELECT id, attempt_index, score, current_question_index, status
+      FROM quiz_attempts
+      WHERE user_id = ? AND status = 'in_progress'
+      ORDER BY id DESC
+      LIMIT 1
+    `).get(userId);
+
+    if (!attempt) return res.status(404).json({ error: "No in-progress attempt" });
+
+    const questions = loadQuizQuestions();
+    const question = questions[attempt.current_question_index];
+    if (!question) {
+      return res.status(400).json({ error: "Quiz state is out of sync with questions.json" });
+    }
+
+    return res.json({
+      attemptId: `att_${attempt.id}`,
+      attemptNumber: attempt.attempt_index,
+      hasPassedQuiz,
+      quizCompletedSuccessfully: hasPassedQuiz,
+      questionNumber: attempt.current_question_index + 1,
+      totalQuestions: QUIZ_LENGTH,
+      timeLimitSec: 30,
+      question: toPublicQuestion(question, attempt.current_question_index)
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to fetch current question" });
+  }
+});
+
+app.post("/quiz/answer", authMiddleware, (req, res) => {
+  try {
+    const userId = Number(req.user?.sub);
+    if (!userId) return res.status(401).json({ error: "Invalid token" });
+    const hasPassedQuiz = hasUserPassedQuiz(userId);
+
+    const attemptId = parseAttemptId(req.body?.attemptId);
+    const questionId = String(req.body?.questionId ?? "");
+    const selectedOptionId = String(req.body?.selectedOptionId ?? "");
+    const timeTakenSec = Number(req.body?.timeTakenSec ?? 0);
+
+    if (!attemptId || !questionId || !selectedOptionId) {
+      return res.status(400).json({ error: "attemptId, questionId and selectedOptionId are required" });
+    }
+
+    const attempt = db.prepare(`
+      SELECT id, attempt_index, score, current_question_index, status
+      FROM quiz_attempts
+      WHERE user_id = ? AND id = ? AND status = 'in_progress'
+      LIMIT 1
+    `).get(userId, attemptId);
+
+    if (!attempt) return res.status(404).json({ error: "No in-progress attempt" });
+
+    const questions = loadQuizQuestions();
+    const index = attempt.current_question_index;
+    const question = questions[index];
+
+    if (!question) {
+      return res.status(400).json({ error: "Quiz state is out of sync with questions.json" });
+    }
+
+    const expectedQuestionId = String(question.id ?? index + 1);
+    if (questionId !== expectedQuestionId) {
+      return res.status(409).json({ error: "Question mismatch for current attempt state" });
+    }
+
+    const correctOptionId = resolveCorrectOptionId(question, index);
+    if (!correctOptionId) {
+      return res.status(500).json({ error: "Question does not define a valid correct answer" });
+    }
+
+    const isCorrect = normalizeAnswer(selectedOptionId) === correctOptionId;
+
+    db.prepare(`
+      INSERT INTO attempt_answers (attempt_id, question_id, question_index, answer_given, is_correct)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(
+      attempt.id,
+      String(question.id ?? index + 1),
+      index,
+      JSON.stringify({ selectedOptionId, timeTakenSec }),
+      isCorrect ? 1 : 0
+    );
+
+    if (!isCorrect) {
+      db.prepare(`
+        UPDATE quiz_attempts
+        SET status = 'failed', ended_at = datetime('now')
+        WHERE id = ?
+      `).run(attempt.id);
+
+      return res.json({
+        result: "incorrect",
+        attemptStatus: "failed",
+        attemptNumber: attempt.attempt_index,
+        hasPassedQuiz,
+        quizCompletedSuccessfully: hasPassedQuiz,
+        message: "Incorrect answer. Attempt ended."
+      });
+    }
+
+    const nextScore = attempt.score + 10;
+    const nextIndex = index + 1;
+
+    if (nextIndex >= QUIZ_LENGTH) {
+      db.prepare(`
+        UPDATE quiz_attempts
+        SET score = ?, current_question_index = ?, status = 'completed', ended_at = datetime('now')
+        WHERE id = ?
+      `).run(nextScore, nextIndex, attempt.id);
+
+      return res.json({
+        result: "correct",
+        attemptStatus: "passed",
+        attemptNumber: attempt.attempt_index,
+        hasPassedQuiz: true,
+        quizCompletedSuccessfully: true,
+        message: "Quiz completed successfully"
+      });
+    }
+
+    db.prepare(`
+      UPDATE quiz_attempts
+      SET score = ?, current_question_index = ?
+      WHERE id = ?
+    `).run(nextScore, nextIndex, attempt.id);
+
+    return res.json({
+      result: "correct",
+      attemptStatus: "in_progress",
+      attemptNumber: attempt.attempt_index,
+      hasPassedQuiz,
+      quizCompletedSuccessfully: hasPassedQuiz,
+      nextQuestion: {
+        attemptNumber: attempt.attempt_index,
+        questionNumber: nextIndex + 1,
+        totalQuestions: QUIZ_LENGTH,
+        timeLimitSec: 30,
+        question: toPublicQuestion(questions[nextIndex], nextIndex)
+      }
+    });
+  } catch (err) {
+    if (String(err?.message || "").includes("UNIQUE constraint failed: attempt_answers")) {
+      return res.status(409).json({ error: "Current question already answered" });
+    }
+    console.error(err);
+    return res.status(500).json({ error: "Failed to submit answer" });
+  }
+});
+
+app.post("/quiz/timeout", authMiddleware, (req, res) => {
+  try {
+    const userId = Number(req.user?.sub);
+    if (!userId) return res.status(401).json({ error: "Invalid token" });
+
+    const attemptId = parseAttemptId(req.body?.attemptId);
+    const questionId = String(req.body?.questionId ?? "");
+    if (!attemptId || !questionId) {
+      return res.status(400).json({ error: "attemptId and questionId are required" });
+    }
+
+    const attempt = db.prepare(`
+      SELECT id, current_question_index
+      FROM quiz_attempts
+      WHERE user_id = ? AND id = ? AND status = 'in_progress'
+      LIMIT 1
+    `).get(userId, attemptId);
+
+    if (!attempt) return res.status(404).json({ error: "No in-progress attempt" });
+
+    const questions = loadQuizQuestions();
+    const current = questions[attempt.current_question_index];
+    const expectedQuestionId = String(current?.id ?? attempt.current_question_index + 1);
+
+    if (questionId !== expectedQuestionId) {
+      return res.status(409).json({ error: "Question mismatch for current attempt state" });
+    }
+
+    db.prepare(`
+      UPDATE quiz_attempts
+      SET status = 'failed', ended_at = datetime('now')
+      WHERE id = ?
+    `).run(attempt.id);
+
+    return res.json({
+      attemptStatus: "failed",
+      message: "Time expired. Attempt ended."
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to process timeout" });
+  }
 });
 
 /* ---------------- SERVER ---------------- */
