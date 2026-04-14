@@ -26,6 +26,61 @@ try {
 } catch {
   // ignore if column already exists
 }
+try {
+  db.exec("ALTER TABLE users ADD COLUMN creative_submission_score INTEGER;");
+} catch {
+  // ignore if column already exists
+}
+try {
+  db.exec("ALTER TABLE users ADD COLUMN creative_submission_text TEXT;");
+} catch {
+  // ignore if column already exists
+}
+try {
+  db.exec("ALTER TABLE users ADD COLUMN creative_submission_sentiment TEXT;");
+} catch {
+  // ignore if column already exists
+}
+try {
+  db.exec("ALTER TABLE users ADD COLUMN creative_submission_is_on_topic INTEGER;");
+} catch {
+  // ignore if column already exists
+}
+try {
+  db.exec("ALTER TABLE users ADD COLUMN creative_submission_completed INTEGER NOT NULL DEFAULT 0;");
+} catch {
+  // ignore if column already exists
+}
+try {
+  db.exec("ALTER TABLE users ADD COLUMN creative_submission_submitted_at TEXT;");
+} catch {
+  // ignore if column already exists
+}
+try {
+  db.exec("ALTER TABLE users ADD COLUMN creative_score_relevance INTEGER;");
+} catch {
+  // ignore if column already exists
+}
+try {
+  db.exec("ALTER TABLE users ADD COLUMN creative_score_creativity INTEGER;");
+} catch {
+  // ignore if column already exists
+}
+try {
+  db.exec("ALTER TABLE users ADD COLUMN creative_score_clarity INTEGER;");
+} catch {
+  // ignore if column already exists
+}
+try {
+  db.exec("ALTER TABLE users ADD COLUMN creative_score_metaphor INTEGER;");
+} catch {
+  // ignore if column already exists
+}
+try {
+  db.exec("ALTER TABLE users ADD COLUMN creative_score_impact INTEGER;");
+} catch {
+  // ignore if column already exists
+}
 db.exec(`
   CREATE TABLE IF NOT EXISTS email_otps (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

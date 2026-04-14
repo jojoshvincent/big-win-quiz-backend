@@ -1,16 +1,26 @@
 const HF_API_KEY = process.env.HUGGINGFACE_API_KEY || "REPLACE_WITH_YOUR_HUGGINGFACE_API_KEY";
-const DEFAULT_HF_SENTIMENT_MODEL = "cardiffnlp/twitter-roberta-base-sentiment-latest";
-const HF_SENTIMENT_MODEL = process.env.HF_SENTIMENT_MODEL || DEFAULT_HF_SENTIMENT_MODEL;
+/** Prefer a chat/instruct model; defaults to Llama 3 Instruct. */
+const HF_GRADING_MODEL =
+  process.env.HF_GRADING_MODEL ||
+  process.env.HF_SENTIMENT_MODEL ||
+  "meta-llama/Meta-Llama-3-8B-Instruct";
 
-const POSITIVE_CUES = new Set([
-  "happy", "excited", "joy", "joyful", "grateful", "thrilled", "amazing", "great", "wonderful", "blessed", "proud"
-]);
-const NEGATIVE_CUES = new Set([
-  "sad", "angry", "upset", "worried", "anxious", "fear", "regret", "stressed", "bad", "terrible", "awful"
-]);
+const CHAT_COMPLETIONS_URL = "https://router.huggingface.co/v1/chat/completions";
+
+/** Score when text fails topic check; no LLM grading is run. */
+const OFF_TOPIC_MIN_SCORE = 0;
+
 const CAR_WIN_CUES = new Set([
   "win", "won", "winning", "car", "vehicle", "prize", "lottery", "reward", "dream", "keys"
 ]);
+
+const GRADING_KEYS = [
+  "relevanceToPrompt",
+  "creativityOriginality",
+  "clarityExpression",
+  "metaphoricalResonance",
+  "overallImpact"
+];
 
 function normalizeTokens(text) {
   return String(text ?? "").toLowerCase().match(/[a-z0-9']+/g) ?? [];
@@ -25,202 +35,189 @@ function contextAgent(tokens) {
   const hitTokens = tokens.filter((token) => CAR_WIN_CUES.has(token));
   const hitSet = new Set(hitTokens);
   const hasCar = hitSet.has("car") || hitSet.has("vehicle") || hitSet.has("keys");
-  const hasWin = hitSet.has("win") || hitSet.has("won") || hitSet.has("winning") || hitSet.has("prize") || hitSet.has("lottery") || hitSet.has("reward");
+  const hasWin =
+    hitSet.has("win") ||
+    hitSet.has("won") ||
+    hitSet.has("winning") ||
+    hitSet.has("prize") ||
+    hitSet.has("lottery") ||
+    hitSet.has("reward");
   const isOnTopic = hasCar && hasWin;
-  const confidence = isOnTopic ? 0.92 : Math.min(0.75, hitSet.size * 0.15);
   return {
     agent: "intent-context-agent",
     isOnTopic,
     topic: "winning a car",
-    confidence,
     topicHits: [...hitSet]
   };
 }
 
-async function sentimentModelAgent(text) {
+function clampScore(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return 0;
+  return Math.max(0, Math.min(100, Math.round(x)));
+}
+
+function averageScores(grading) {
+  const vals = GRADING_KEYS.map((k) => clampScore(grading[k]));
+  const sum = vals.reduce((a, b) => a + b, 0);
+  return Math.round(sum / vals.length);
+}
+
+function emptyGradingZeros() {
+  const g = {};
+  for (const k of GRADING_KEYS) g[k] = 0;
+  return g;
+}
+
+function extractJsonObject(raw) {
+  const text = String(raw ?? "").trim();
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fence ? fence[1].trim() : text;
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error("No JSON object found in model output");
+  }
+  return JSON.parse(candidate.slice(start, end + 1));
+}
+
+async function hfChatGrade(text, modelId) {
   if (!HF_API_KEY || HF_API_KEY === "REPLACE_WITH_YOUR_HUGGINGFACE_API_KEY") {
     throw new Error("Hugging Face API key is missing. Set HUGGINGFACE_API_KEY.");
   }
 
-  const payload = JSON.stringify({ inputs: text, options: { wait_for_model: true } });
-  const headers = {
-    Authorization: `Bearer ${HF_API_KEY}`,
-    "Content-Type": "application/json"
-  };
+  const userContent = `You are grading a short creative writing submission.
 
-  const candidateModels = HF_SENTIMENT_MODEL === DEFAULT_HF_SENTIMENT_MODEL
-    ? [HF_SENTIMENT_MODEL]
-    : [HF_SENTIMENT_MODEL, DEFAULT_HF_SENTIMENT_MODEL];
+Prompt focus: the writer's feelings about winning a car.
+The submission is exactly 25 words (do not penalize length).
 
-  let response = null;
-  let selectedModel = HF_SENTIMENT_MODEL;
-  let lastErrorDetails = "";
+Score each criterion as an integer from 0 to 100:
+1. Relevance to the Prompt
+2. Creativity & Originality
+3. Clarity & Expression
+4. Metaphorical Resonance
+5. Overall Impact
 
-  for (const model of candidateModels) {
-    const candidateUrls = [
-      `https://router.huggingface.co/hf-inference/models/${model}`,
-      `https://router.huggingface.co/models/${model}`
-    ];
+Return ONLY valid JSON with exactly these keys and integer values (no markdown, no extra text):
+{"relevanceToPrompt":N,"creativityOriginality":N,"clarityExpression":N,"metaphoricalResonance":N,"overallImpact":N}
 
-    for (const url of candidateUrls) {
-      response = await fetch(url, {
-        method: "POST",
-        headers,
-        body: payload
-      });
-      if (response.ok) {
-        selectedModel = model;
-        break;
-      }
-      const details = await response.text();
-      lastErrorDetails = `${url} -> (${response.status}) ${details}`;
-      // Retry only when route is not found. For auth/rate-limit/model errors, fail fast.
-      if (response.status !== 404) {
-        throw new Error(`Hugging Face sentiment call failed: ${lastErrorDetails}`);
-      }
-    }
-    if (response?.ok) break;
-  }
+Submission text:
+${text}`;
 
-  if (!response || !response.ok) {
-    throw new Error(`Hugging Face sentiment call failed after router attempts: ${lastErrorDetails}`);
+  const response = await fetch(CHAT_COMPLETIONS_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${HF_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: modelId,
+      messages: [
+        {
+          role: "system",
+          content: "You output only valid JSON objects for rubric scores. No prose outside JSON."
+        },
+        { role: "user", content: userContent }
+      ],
+      temperature: 0.25,
+      max_tokens: 256
+    })
+  });
+
+  if (!response.ok) {
+    const details = await response.text();
+    throw new Error(`Hugging Face chat grading failed (${response.status}): ${details}`);
   }
 
   const data = await response.json();
-  const labels = Array.isArray(data?.[0]) ? data[0] : Array.isArray(data) ? data : [];
-  if (!labels.length) {
-    throw new Error("Unexpected sentiment response format from Hugging Face.");
+  const content = data?.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error("Unexpected chat completion response format from Hugging Face.");
   }
 
-  const top = [...labels].sort((a, b) => Number(b.score) - Number(a.score))[0];
-  const normalizedLabel = String(top?.label ?? "").toLowerCase();
-  let sentiment = "neutral";
-  if (normalizedLabel.includes("pos")) sentiment = "positive";
-  else if (normalizedLabel.includes("neg")) sentiment = "negative";
-
-  return {
-    agent: "llm-sentiment-agent",
-    sentiment,
-    confidence: Number(top?.score ?? 0.5),
-    model: selectedModel
-  };
-}
-
-function emotionAgent(tokens) {
-  const emotionHits = [];
-  for (const token of tokens) {
-    if (POSITIVE_CUES.has(token) || NEGATIVE_CUES.has(token)) emotionHits.push(token);
-  }
-  const unique = [...new Set(emotionHits)];
-  return {
-    agent: "emotion-agent",
-    cues: unique
-  };
-}
-
-function scoringAgent({ sentiment, confidence }, context) {
-  let score = 50;
-  if (sentiment === "positive") score = 50 + Math.round(confidence * 50);
-  if (sentiment === "negative") score = 50 - Math.round(confidence * 50);
-  if (!context.isOnTopic) score -= 10;
-  score = Math.max(0, Math.min(100, score));
-  return { agent: "score-agent", score };
-}
-
-function reasoningAgent({ sentiment }, context, emotions, text) {
-  const evidencePhrases = [];
-  const lower = text.toLowerCase();
-  const evidenceSeeds = ["won", "winning", "car", "prize", "lottery", "dream", "happy", "excited", "grateful", "sad", "worried"];
-  for (const seed of evidenceSeeds) {
-    if (lower.includes(seed)) evidencePhrases.push(seed);
-  }
-  const uniqueEvidence = [...new Set(evidencePhrases)].slice(0, 5);
-
-  let reason = "The sentiment is inferred from the emotional cues in the text.";
-  if (context.isOnTopic) {
-    if (sentiment === "positive") {
-      reason = "The text directly references winning a car and uses positive emotional cues, indicating a favorable feeling about the event.";
-    } else if (sentiment === "negative") {
-      reason = "Although the text references winning a car, the emotional cues are negative or conflicted, indicating concern or dissatisfaction.";
-    } else {
-      reason = "The text references winning a car, but emotional intensity is balanced or unclear, resulting in a neutral interpretation.";
+  const parsed = extractJsonObject(content);
+  const grading = {};
+  for (const key of GRADING_KEYS) {
+    if (!(key in parsed)) {
+      throw new Error(`Missing rubric key in model JSON: ${key}`);
     }
-  } else {
-    reason = "The text does not clearly describe a person's feelings about winning a car, so confidence in topic-specific sentiment is reduced.";
+    grading[key] = clampScore(parsed[key]);
   }
-
-  return {
-    agent: "reasoning-agent",
-    reason,
-    evidencePhrases: uniqueEvidence,
-    emotions: emotions.cues
-  };
+  return grading;
 }
 
-function responseAgent(sentiment, score) {
-  if (sentiment === "positive") {
-    return { message: "The text expresses a positive feeling." };
+async function llmGradingAgent(text) {
+  const candidates = [...new Set([HF_GRADING_MODEL, process.env.HF_SENTIMENT_MODEL, "meta-llama/Meta-Llama-3-8B-Instruct"].filter(Boolean))];
+  let lastErr = null;
+  for (const modelId of candidates) {
+    try {
+      const grading = await hfChatGrade(text, modelId);
+      return {
+        agent: "llm-rubric-agent",
+        grading,
+        model: modelId
+      };
+    } catch (e) {
+      lastErr = e;
+    }
   }
-  if (sentiment === "negative") {
-    return { message: "The text expresses a negative feeling." };
-  }
-  if (score >= 60) {
-    return { message: "The text is mostly positive with mild emotional strength." };
-  }
-  if (score <= 40) {
-    return { message: "The text is mostly negative with mild emotional strength." };
-  }
-  return { message: "The text expresses a neutral feeling." };
-}
-
-function criticAgent(payload) {
-  const hasReason = typeof payload.reason === "string" && payload.reason.length > 0;
-  const hasScore = Number.isFinite(payload.score) && payload.score >= 0 && payload.score <= 100;
-  return {
-    agent: "critic-agent",
-    valid: hasReason && hasScore
-  };
+  throw lastErr ?? new Error("LLM grading failed");
 }
 
 export async function analyzeSentimentAgentic(text) {
   const tokenizerOutput = tokenizationAgent(text);
   const contextOutput = contextAgent(tokenizerOutput.tokens);
-  const sentimentOutput = await sentimentModelAgent(text);
-  const emotionOutput = emotionAgent(tokenizerOutput.tokens);
-  const scoreOutput = scoringAgent(sentimentOutput, contextOutput);
-  const reasoningOutput = reasoningAgent(sentimentOutput, contextOutput, emotionOutput, text);
-  const responseOutput = responseAgent(sentimentOutput.sentiment, scoreOutput.score);
-  const criticOutput = criticAgent({
-    reason: reasoningOutput.reason,
-    score: scoreOutput.score
-  });
 
-  if (!criticOutput.valid) {
-    throw new Error("Agentic sentiment output did not pass validation.");
+  if (!contextOutput.isOnTopic) {
+    const zeros = emptyGradingZeros();
+    return {
+      wordCount: tokenizerOutput.wordCount,
+      sentiment: "out_of_topic",
+      message: "The text is not about winning a car, so grading was not performed.",
+      score: OFF_TOPIC_MIN_SCORE,
+      reason:
+        "The text does not clearly relate to feelings about winning a car (missing expected topic cues). Rubric scoring was skipped and the minimum aggregate was assigned.",
+      evidencePhrases: [],
+      isOnTopic: false,
+      topic: contextOutput.topic,
+      emotions: [],
+      grading: zeros,
+      agents: {
+        tokenizer: tokenizerOutput.agent,
+        context: contextOutput.agent,
+        topicGate: "topic-gate-agent",
+        grader: "skipped"
+      },
+      meta: {
+        provider: "huggingface",
+        model: null,
+        skippedReason: "off_topic"
+      }
+    };
   }
+
+  const gradingOutput = await llmGradingAgent(text);
+  const aggregateScore = averageScores(gradingOutput.grading);
 
   return {
     wordCount: tokenizerOutput.wordCount,
-    sentiment: sentimentOutput.sentiment,
-    message: responseOutput.message,
-    score: scoreOutput.score,
-    reason: reasoningOutput.reason,
-    evidencePhrases: reasoningOutput.evidencePhrases,
-    isOnTopic: contextOutput.isOnTopic,
+    sentiment: "graded",
+    message: "Submission graded using the rubric model.",
+    score: aggregateScore,
+    reason: "Scores are produced by the LLM rubric for relevance, creativity, clarity, metaphor, and impact.",
+    evidencePhrases: [],
+    isOnTopic: true,
     topic: contextOutput.topic,
-    emotions: reasoningOutput.emotions,
+    emotions: [],
+    grading: gradingOutput.grading,
     agents: {
       tokenizer: tokenizerOutput.agent,
       context: contextOutput.agent,
-      sentiment: sentimentOutput.agent,
-      emotion: emotionOutput.agent,
-      reasoner: reasoningOutput.agent,
-      scorer: scoreOutput.agent,
-      critic: criticOutput.agent
+      grader: gradingOutput.agent
     },
     meta: {
       provider: "huggingface",
-      model: sentimentOutput.model
+      model: gradingOutput.model
     }
   };
 }

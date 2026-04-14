@@ -116,42 +116,196 @@ app.get("/health", (req, res) => {
 
 /* ---------------- SENTIMENT (AGENTIC) ---------------- */
 
+function sentimentAnalysisJson(analysis) {
+  return {
+    message: analysis.message,
+    sentiment: analysis.sentiment,
+    score: analysis.score,
+    scoreOutOf: 100,
+    grading: analysis.grading,
+    reason: analysis.reason,
+    evidencePhrases: analysis.evidencePhrases,
+    context: {
+      isOnTopic: analysis.isOnTopic,
+      topic: analysis.topic,
+      emotions: analysis.emotions
+    },
+    meta: {
+      provider: analysis.meta.provider,
+      model: analysis.meta.model,
+      agents: analysis.agents,
+      skippedReason: analysis.meta.skippedReason ?? null
+    }
+  };
+}
+
+function parseSubmissionText(req) {
+  const text = String(req.body?.text ?? "").trim();
+  if (!text) return { error: "text is required" };
+  return { text };
+}
+
+function validateWordCount(analysis) {
+  if (analysis.wordCount !== 25) {
+    return {
+      error: "text must contain exactly 25 words",
+      receivedWordCount: analysis.wordCount
+    };
+  }
+  return null;
+}
+
+function saveCreativeSubmissionOrThrow(userId, text, analysis) {
+  const existing = db.prepare(`
+    SELECT creative_submission_completed
+    FROM users WHERE id = ?
+  `).get(userId);
+
+  if (!existing) {
+    const err = new Error("User not found");
+    err.status = 401;
+    throw err;
+  }
+
+  if (Number(existing.creative_submission_completed) === 1) {
+    const err = new Error("Creative submission already completed");
+    err.status = 409;
+    throw err;
+  }
+
+  const g = analysis.grading;
+  db.prepare(`
+    UPDATE users SET
+      creative_submission_score = ?,
+      creative_score_relevance = ?,
+      creative_score_creativity = ?,
+      creative_score_clarity = ?,
+      creative_score_metaphor = ?,
+      creative_score_impact = ?,
+      creative_submission_text = ?,
+      creative_submission_sentiment = ?,
+      creative_submission_is_on_topic = ?,
+      creative_submission_completed = 1,
+      creative_submission_submitted_at = datetime('now')
+    WHERE id = ?
+  `).run(
+    analysis.score,
+    g.relevanceToPrompt,
+    g.creativityOriginality,
+    g.clarityExpression,
+    g.metaphoricalResonance,
+    g.overallImpact,
+    text,
+    analysis.sentiment,
+    analysis.isOnTopic ? 1 : 0,
+    userId
+  );
+
+  const row = db.prepare(`
+    SELECT creative_submission_submitted_at
+    FROM users WHERE id = ?
+  `).get(userId);
+
+  return {
+    completed: true,
+    score: analysis.score,
+    submittedAt: row?.creative_submission_submitted_at ?? null
+  };
+}
+
+function getCreativeRankingForUser(userId) {
+  const totalUsers = Number(db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM users
+    WHERE creative_submission_completed = 1
+      AND creative_submission_score IS NOT NULL
+  `).get()?.count ?? 0);
+
+  const userRow = db.prepare(`
+    SELECT creative_submission_completed, creative_submission_score
+    FROM users
+    WHERE id = ?
+  `).get(userId);
+
+  const completed = Number(userRow?.creative_submission_completed ?? 0) === 1;
+  const score = userRow?.creative_submission_score;
+  if (!completed || score === null || score === undefined || totalUsers === 0) {
+    return {
+      rank: null,
+      totalUsers,
+      topPercent: null,
+      topPercentRounded: null,
+      topLabel: null
+    };
+  }
+
+  const higherScoreBands = Number(db.prepare(`
+    SELECT COUNT(DISTINCT creative_submission_score) AS count
+    FROM users
+    WHERE creative_submission_completed = 1
+      AND creative_submission_score IS NOT NULL
+      AND creative_submission_score > ?
+  `).get(score)?.count ?? 0);
+
+  const rank = higherScoreBands + 1;
+  const topPercent = Number(((rank / totalUsers) * 100).toFixed(2));
+  const topPercentRounded = Math.max(1, Math.ceil(topPercent));
+
+  return {
+    rank,
+    totalUsers,
+    topPercent,
+    topPercentRounded,
+    topLabel: `Top ${topPercentRounded}% of ${totalUsers} users`
+  };
+}
+
 app.post("/sentiment/analyze", async (req, res) => {
   try {
-    const text = String(req.body?.text ?? "").trim();
-    if (!text) {
-      return res.status(400).json({ error: "text is required" });
-    }
+    const parsed = parseSubmissionText(req);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
 
-    const analysis = await analyzeSentimentAgentic(text);
-    if (analysis.wordCount !== 25) {
-      return res.status(400).json({
-        error: "text must contain exactly 25 words",
-        receivedWordCount: analysis.wordCount
-      });
-    }
+    const analysis = await analyzeSentimentAgentic(parsed.text);
+    const wordCountError = validateWordCount(analysis);
+    if (wordCountError) return res.status(400).json(wordCountError);
 
-    return res.json({
-      message: analysis.message,
-      sentiment: analysis.sentiment,
-      score: analysis.score,
-      scoreOutOf: 100,
-      reason: analysis.reason,
-      evidencePhrases: analysis.evidencePhrases,
-      context: {
-        isOnTopic: analysis.isOnTopic,
-        topic: analysis.topic,
-        emotions: analysis.emotions
-      },
-      meta: {
-        provider: analysis.meta.provider,
-        model: analysis.meta.model,
-        agents: analysis.agents
-      }
-    });
+    return res.json(sentimentAnalysisJson(analysis));
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Failed to analyze sentiment" });
+  }
+});
+
+/* ---------------- CREATIVE SUBMISSION (AUTH, PERSISTED) ---------------- */
+
+app.post("/creative-submission", authMiddleware, async (req, res) => {
+  try {
+    const userId = Number(req.user?.sub);
+    if (!userId) return res.status(401).json({ error: "Invalid token" });
+
+    const parsed = parseSubmissionText(req);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+    const analysis = await analyzeSentimentAgentic(parsed.text);
+    const wordCountError = validateWordCount(analysis);
+    if (wordCountError) return res.status(400).json(wordCountError);
+
+    const creativeSubmission = saveCreativeSubmissionOrThrow(userId, parsed.text, analysis);
+    const ranking = getCreativeRankingForUser(userId);
+
+    return res.status(201).json({
+      ...sentimentAnalysisJson(analysis),
+      creativeSubmission: {
+        ...creativeSubmission,
+        ranking
+      }
+    });
+  } catch (err) {
+    if (err?.status) {
+      return res.status(err.status).json({ error: err.message });
+    }
+    console.error(err);
+    return res.status(500).json({ error: "Failed to save creative submission" });
   }
 });
 
@@ -312,7 +466,22 @@ app.get("/dashboard", authMiddleware, (req, res) => {
     if (!userId) return res.status(401).json({ error: "Invalid token" });
 
     const userRow = db.prepare(`
-      SELECT id, email, name FROM users WHERE id = ?
+      SELECT
+        id,
+        email,
+        name,
+        creative_submission_completed,
+        creative_submission_score,
+        creative_score_relevance,
+        creative_score_creativity,
+        creative_score_clarity,
+        creative_score_metaphor,
+        creative_score_impact,
+        creative_submission_text,
+        creative_submission_submitted_at,
+        creative_submission_sentiment,
+        creative_submission_is_on_topic
+      FROM users WHERE id = ?
     `).get(userId);
 
     if (!userRow) return res.status(401).json({ error: "User not found" });
@@ -348,6 +517,13 @@ app.get("/dashboard", authMiddleware, (req, res) => {
       ? String(userRow.name).trim()
       : null;
 
+    const creativeCompleted = Number(userRow.creative_submission_completed) === 1;
+    const creativeScoreRaw = userRow.creative_submission_score;
+    const creativeScorePercent =
+      !creativeCompleted || creativeScoreRaw === null || creativeScoreRaw === undefined
+        ? null
+        : Math.min(100, Math.max(0, Number(creativeScoreRaw)));
+
     return res.json({
       user: {
         id: userRow.id,
@@ -361,11 +537,87 @@ app.get("/dashboard", authMiddleware, (req, res) => {
         attemptCount,
         bestScorePercent,
         lastAttemptStatus
+      },
+      creativeSubmission: {
+        completed: creativeCompleted,
+        scorePercent: creativeScorePercent,
+        grading:
+          creativeCompleted
+            ? {
+                relevanceToPrompt: userRow.creative_score_relevance,
+                creativityOriginality: userRow.creative_score_creativity,
+                clarityExpression: userRow.creative_score_clarity,
+                metaphoricalResonance: userRow.creative_score_metaphor,
+                overallImpact: userRow.creative_score_impact
+              }
+            : null,
+        submittedAt: creativeCompleted ? userRow.creative_submission_submitted_at : null,
+        sentiment: creativeCompleted ? userRow.creative_submission_sentiment : null,
+        isOnTopic:
+          creativeCompleted && userRow.creative_submission_is_on_topic != null
+            ? Boolean(Number(userRow.creative_submission_is_on_topic))
+            : null,
+        text: creativeCompleted ? userRow.creative_submission_text : null
       }
     });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Failed to load dashboard" });
+  }
+});
+
+/* ---------------- SCOREBOARD ---------------- */
+
+app.get("/scoreboard", authMiddleware, (req, res) => {
+  try {
+    const userId = Number(req.user?.sub);
+    if (!userId) return res.status(401).json({ error: "Invalid token" });
+
+    const userRow = db.prepare(`
+      SELECT
+        creative_submission_completed,
+        creative_submission_score,
+        creative_score_relevance,
+        creative_score_creativity,
+        creative_score_clarity,
+        creative_score_metaphor,
+        creative_score_impact
+      FROM users
+      WHERE id = ?
+      LIMIT 1
+    `).get(userId);
+
+    if (!userRow) return res.status(401).json({ error: "User not found" });
+
+    const completed = Number(userRow.creative_submission_completed) === 1;
+    const scoreRaw = userRow.creative_submission_score;
+    const scorePercent =
+      !completed || scoreRaw === null || scoreRaw === undefined
+        ? null
+        : Math.min(100, Math.max(0, Number(scoreRaw)));
+
+    const ranking = getCreativeRankingForUser(userId);
+
+    return res.json({
+      creativeSubmission: {
+        completed,
+        scorePercent,
+        grading:
+          completed
+            ? {
+                relevanceToPrompt: userRow.creative_score_relevance,
+                creativityOriginality: userRow.creative_score_creativity,
+                clarityExpression: userRow.creative_score_clarity,
+                metaphoricalResonance: userRow.creative_score_metaphor,
+                overallImpact: userRow.creative_score_impact
+              }
+            : null,
+        ranking
+      }
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to load scoreboard" });
   }
 });
 
